@@ -6,6 +6,7 @@ use Fusion\Models\File;
 use Fusion\Models\Field;
 use Fusion\Models\Matrix;
 use Fusion\Models\Section;
+use Fusion\Models\Setting;
 use Fusion\Models\Taxonomy;
 use Illuminate\Support\Str;
 use Corcel\Model\Attachment;
@@ -22,6 +23,22 @@ use Corcel\WooCommerce\Model\Product as WooCommerceProduct;
 class Fusion extends \Ant\FusionHelper\FusionImporter {
 
     protected static $mappedIds = [];
+
+    public static function makePublicFolderForAddon($addonName, $path)
+    { 
+        $basePath = $path;
+
+        if (!\File::isDirectory(public_path("addons"))) {
+            \File::makeDirectory(public_path("addons"));
+        }
+        if (!\File::exists(public_path("addons/{$addonName}"))) {
+            // Create symlink
+            \File::link(
+                "{$basePath}/public",
+                public_path("addons/{$addonName}")
+            );
+        }
+    }
 
     public static function createCollectionEntry($matrixHandle, $attributes = [])
     {
@@ -58,6 +75,26 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
         }
     }
 
+    public static function persistRelationship($entry, $handle, $values) {
+        $field = $entry->fields->firstWhere('handle', $handle);
+
+        $oldValues = isset($entry->{$field->handle}) ? $entry->{$field->handle}->pluck('id') : [];
+        $counter = 0;
+        $newValues = collect($values)
+            ->mapWithKeys(function ($id) use ($field, $counter) {
+                return [
+                    $id => [
+                        'field_id' => $field->id,
+                        'order' => $counter++,
+                    ],
+                ];
+            });
+
+        $entry->{$field->handle}()->wherePivot('field_id', $field->id)->detach($oldValues);
+        $entry->{$field->handle}()->attach($newValues);
+        $entry->flush();
+    }
+
     public static function getRulesForMatrix($matrix)
     {
         $rules = [
@@ -72,6 +109,53 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
         return $rules;
     }
 
+    public static function createFieldForTaxonomy($handle, $sectionHandle, $fields) {
+        $taxonomy = \Fusion\Models\Taxonomy::where('handle', $handle)->first();
+
+        if (!isset($taxonomy)) throw new \Exception('Taxonomy "'.$handle.'" is not exist');
+        
+        $section = $taxonomy->blueprint->sections->firstWhere('handle', $sectionHandle);
+
+        if (!isset($section)) {
+            $section = Section::create([
+                'name' => Str::title($sectionHandle),
+                'handle' => $sectionHandle,
+                'blueprint_id' => $taxonomy->blueprint->id,
+            ]);
+        }
+
+        if (count($fields)) {
+            foreach ($fields as $fieldData) {
+                $field = Field::make($fieldData);
+                $field->fieldable_id = $section->id;
+                $field->fieldable_type = Section::class;
+                $field->save();
+            }
+        }
+    }
+
+    public static function createFieldForMatrix($handle, $fields, $sectionHandle = 'general', $sectionName = null) {
+        $matrix = \Fusion\Models\Matrix::where('handle', $handle)->first();
+
+        if (!isset($matrix)) throw new \Exception('Matrix "'.$handle.'" is not exist');
+
+        if (count($fields)) {
+            $section = Section::updateOrCreate([
+                'handle' => $sectionHandle,
+                'blueprint_id' => $matrix->blueprint->id,
+            ], [
+                'name' => $sectionName ?? Str::title($sectionHandle),
+            ]);
+
+            foreach ($fields as $fieldData) {
+                $field = Field::make($fieldData);
+                $field->fieldable_id = $section->id;
+                $field->fieldable_type = Section::class;
+                $field->save();
+            }
+        }
+    }
+
     public static function deleteFieldForExtension($handle, $fieldHandle) {
         $extension = \Fusion\Models\Extension::where('handle', $handle)->firstOrFail();
         $field = $extension->fields->firstWhere('handle', $fieldHandle);
@@ -81,6 +165,14 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
     public static function createFieldForExtension($handle, $sectionHandle, $fields) {
         $extension = \Fusion\Models\Extension::where('handle', $handle)->firstOrFail();
         $section = $extension->blueprint->sections->firstWhere('handle', $sectionHandle);
+
+        if (!isset($section)) {
+            $section = Section::create([
+                'name' => Str::title($sectionHandle),
+                'handle' => $sectionHandle,
+                'blueprint_id' => $extension->blueprint->id,
+            ]);
+        }
         
         foreach ($fields as $fieldData) {
             $field = $section->fields()->make($fieldData);
@@ -120,9 +212,34 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
         $matrix->delete();
     }
 
+    public static function createSetting($name, $handle, $group, $icon, $fields = []) {
+        $setting = Setting::create([
+            'name' => $name,
+            'handle' => $handle,
+            'group' => $group,
+            'icon' => $icon,
+        ]);
+
+        if (count($fields)) {
+            $section = Section::create([
+                'name' => 'General',
+                'handle' => 'general',
+                'blueprint_id' => $setting->blueprint->id,
+            ]);
+
+            foreach ($fields as $fieldData) {
+                $field = Field::make($fieldData);
+                $field->fieldable_id = $section->id;
+                $field->fieldable_type = Section::class;
+                $field->save();
+            }
+        }
+
+        return $setting;
+    }
+
     public static function createCollection($name, $handle, $fields = []) {
-        $matrix = null;
-        \DB::transaction(function() use($name, $handle, $fields, &$matrix) {
+        return \DB::transaction(function() use($name, $handle, $fields, &$matrix) {
             $matrix = Matrix::create([
                 'name' => $name,
                 'handle' => $handle,
@@ -144,9 +261,8 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
                     $field->save();
                 }
             }
+			return $matrix;
         });
-
-        return $matrix;
     }
 
     public static function getMatrixId($handle)
@@ -411,23 +527,46 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
             $name = pathinfo($url, PATHINFO_FILENAME);
             $extension = pathinfo($url, PATHINFO_EXTENSION);
 
+            $location = static::getLocationToBeSaved($fileUid, $name, $extension, $directory);
+            $storage = $directory->disk->handle;
+            $mimetype = Storage::disk($storage)->mimetype($location);
+            $filetype = strtok($mimetype, '/');
+            
+            if ($filetype == 'image') {
+				try {
+					// Only working for local file
+                	list($width, $height) = getimagesize($url);
+				} catch (\Throwable $ex) {
+				} 
+                $attributes = array_merge([
+                    'width' => $width,
+                    'height' => $height,
+                ], $attributes);
+            }
+
             return static::updateOrCreateFileModelByLocation($fileUid, $name, $extension, $directory, $attributes);
         }
     }
 
     protected static function updateOrCreateFileModelByLocation($fileUid, $name, $extension, $directory = null, $attributes = [])
     {
+        $storage = $directory->disk->handle;
         $location = static::getLocationToBeSaved($fileUid, $name, $extension, $directory);
-        $bytes = Storage::disk('public')->size($location);
-        $mimetype = Storage::disk('public')->mimetype($location);
-        $fullPath = Storage::disk('public')->path($location);
+        $bytes = Storage::disk($storage)->size($location);
+        $mimetype = Storage::disk($storage)->mimetype($location);
+
+        $fullPath = Storage::disk($storage)->path($location);
         $filetype = strtok($mimetype, '/');
         
         if ($filetype == 'image') {
-            list($width, $height) = getimagesize($fullPath);
+			try {
+				// Only working for local file
+            	list($width, $height) = getimagesize($fullPath);
+			} catch (\Throwable $ex) {
+			}
         }
 
-        $disk = DB::table('disks')->where('handle', 'public')->first();
+        $disk = DB::table('disks')->where('handle', $storage)->first();
 
         return File::updateOrCreate([
             'directory_id' => $directory->id ?? null,
@@ -459,9 +598,20 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
         
         $location = static::getLocationToBeSaved($uuid, $name, $extension, $directory);
         $filename = trim($extension) != '' ? $name.'.'.$extension : $name;
-
-        Storage::disk('public')->putFileAs('', $url, $location);
+        $storage = $directory->disk->handle;
+        Storage::disk($storage)->putFileAs('', $url, $location);
         static::addSavedFile($directory, $filename, $uuid);
+
+        $mimetype = Storage::disk($storage)->mimetype($location);
+        $filetype = strtok($mimetype, '/');
+        
+        if ($filetype == 'image') {
+            list($width, $height) = getimagesize($url);
+            $attributes = array_merge([
+                'width' => $width,
+                'height' => $height,
+            ], $attributes);
+        }
 
         return static::updateOrCreateFileModelByLocation($uuid, $name, $extension, $directory, $attributes);
     }
@@ -516,6 +666,8 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
             $model->{$field->handle}()->detach($oldValues);
             $model->{$field->handle}()->attach($newValues);
             $model->save(); // To refresh the model cache
+
+            return $model;
         }
     }
 
