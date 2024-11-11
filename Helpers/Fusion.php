@@ -239,7 +239,8 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
     }
 
     public static function createCollection($name, $handle, $fields = []) {
-        return \DB::transaction(function() use($name, $handle, $fields, &$matrix) {
+        // Cannot perform Matrix::create in DB::transaction or it will cause exception, as Matrix::create will call Schema::create which will break database transaction (mysql/mariadb)
+        // return \DB::transaction(function() use($name, $handle, $fields, &$matrix) {
             $matrix = Matrix::create([
                 'name' => $name,
                 'handle' => $handle,
@@ -262,7 +263,7 @@ class Fusion extends \Ant\FusionHelper\FusionImporter {
                 }
             }
 			return $matrix;
-        });
+        // });
     }
 
     public static function getMatrixId($handle)
